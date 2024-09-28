@@ -1,257 +1,347 @@
 import os
-import logging
 import asyncio
+from dotenv import load_dotenv
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
 import re
 import wikipedia
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from groq import Groq
-import chromadb
-from PyPDF2 import PdfReader
-import tempfile
-from langdetect import detect
-from deep_translator import GoogleTranslator
 import requests
-from datetime import datetime
-import pytz
+from bs4 import BeautifulSoup
+import base64
+import io
+from PIL import Image
+import pytesseract
+import logging
+import cv2
+import numpy as np
+from sklearn.cluster import KMeans
+import ollama
+import functools
+import sqlite3
+from chromadb import Client, Settings
+from chromadb.utils import embedding_functions
 
-# Enable logging
+# Set up logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Groq client
-groq_client = Groq(api_key="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")
+# Load environment variables from .env file
+load_dotenv()
 
-# Initialize ChromaDB client
-chroma_client = chromadb.Client()
+# Set up Telegram bot
+telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
+if not telegram_token:
+    raise ValueError("Please set the TELEGRAM_BOT_TOKEN environment variable")
 
-# Create a dictionary to store user-specific collections
-user_collections = {}
+# Set Tesseract path
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# Thinking animation frames with emotions
-thinking_frames = ["🤔", "🧐", "🤨", "😊"]
+# Load face detection cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Emotional responses
-emotions = {
-    "happy": ["😊", "😄", "🎉"],
-    "sad": ["😢", "😔", "🥺"],
-    "excited": ["🤩", "😃", "🙌"],
-    "confused": ["😕", "🤨", "🤷‍♂️"]
+# Try to import the image captioning model, but don't fail if it's not available
+try:
+    from transformers import pipeline
+    caption_model = pipeline("image-to-text", model="nlpconnect/vit-gpt2-image-captioning")
+    CAPTION_MODEL_AVAILABLE = True
+except ImportError:
+    CAPTION_MODEL_AVAILABLE = False
+    logger.warning("Image captioning model not available. Install PyTorch and transformers for this feature.")
+
+# Available models with their characteristics
+MODELS = {
+    "mistral": {"size": "medium", "capabilities": ["general"]},
+    "llama2": {"size": "large", "capabilities": ["general", "complex"]},
+    "llava": {"size": "large", "capabilities": ["vision"]},
+    "stable-diffusion": {"size": "large", "capabilities": ["image-generation"]},
 }
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    await update.message.reply_text('Hi! 👋 Send me a PDF file to process or ask me a question. I can respond in English and Hindi, do math calculations, provide information from Wikipedia, and even tell you your local time! ' + emotions["excited"][0])
+# Set up ChromaDB
+chroma_client = Client(Settings(persist_directory="./chroma_db"))
+sentence_transformer_ef = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+document_collection = chroma_client.get_or_create_collection(name="documents", embedding_function=sentence_transformer_ef)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    help_text = (
-        "Here's what I can do:\n"
-        "1. Process PDF files 📄\n"
-        "2. Answer questions about uploaded PDFs 💬\n"
-        "3. Perform mathematical calculations 🧮\n"
-        "4. Provide information from Wikipedia 📚\n"
-        "5. Communicate in English and Hindi 🌐\n"
-        "6. Get your local time based on IP address 🕰️\n\n"
-        "Just send me a command or ask a question!"
-    )
-    await update.message.reply_text(help_text + " " + emotions["happy"][1])
+# Set up SQLite database
+def init_db():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations
+                 (id INTEGER PRIMARY KEY, user_id INTEGER, message TEXT, response TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
 
-def extract_text_from_pdf(file_path: str) -> str:
-    """Extract text from a PDF file, handling large files."""
-    text = ""
-    with open(file_path, 'rb') as file:
-        reader = PdfReader(file)
-        for page in reader.pages:
-            text += page.extract_text() or ""
-            if len(text) > 1000000:  # Limit to ~1MB of text
-                text += "\n[PDF truncated due to size]"
-                break
-    return text
+async def store_conversation(user_id, message, response):
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO conversations (user_id, message, response) VALUES (?, ?, ?)",
+              (user_id, message, response))
+    conn.commit()
+    conn.close()
 
-async def process_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Process the PDF file and store its content in a user-specific ChromaDB collection."""
-    user_id = update.effective_user.id
-    
-    if not update.message.document:
-        await update.message.reply_text("Please send a PDF file. " + emotions["confused"][0])
-        return
+async def get_user_history(user_id, limit=5):
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute("SELECT message, response FROM conversations WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+              (user_id, limit))
+    history = c.fetchall()
+    conn.close()
+    return history
 
-    thinking_message = await update.message.reply_text(emotions["confused"][1])
-    async def animate_thinking():
-        for frame in thinking_frames:
-            await thinking_message.edit_text(frame)
-            await asyncio.sleep(0.5)
+def select_model(question):
+    if re.search(r'\b(image|picture|photo|visual|see)\b', question, re.IGNORECASE):
+        return "llava"
+    if re.search(r'\b(complex|difficult|advanced)\b', question, re.IGNORECASE):
+        return "llama2"
+    return "mistral"
 
-    thinking_task = asyncio.create_task(animate_thinking())
-
+@functools.lru_cache(maxsize=100)
+def query_local_model(model_name, prompt):
     try:
-        file = await context.bot.get_file(update.message.document.file_id)
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-            await file.download_to_drive(custom_path=tmp_file.name)
-            text = extract_text_from_pdf(tmp_file.name)
+        response = ollama.generate(model=model_name, prompt=prompt)
+        return response['response']
+    except Exception as e:
+        logger.error(f"Error querying local model {model_name}: {str(e)}")
+        return None
 
-        # Create or get user-specific collection
-        if user_id not in user_collections:
-            user_collections[user_id] = chroma_client.create_collection(name=f"user_{user_id}_pdf_data")
+async def search_wikipedia(query):
+    try:
+        return await asyncio.to_thread(wikipedia.summary, query, sentences=3)
+    except Exception as e:
+        logger.error(f"Wikipedia search failed: {str(e)}")
+        return None
+
+async def search_duckduckgo(query):
+    url = f"https://duckduckgo.com/html/?q={query}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                text = await response.text()
+                soup = BeautifulSoup(text, 'html.parser')
+                results = soup.find_all('div', class_='result__body')
+                return results[0].get_text().strip() if results else None
+    except Exception as e:
+        logger.error(f"DuckDuckGo search failed: {str(e)}")
+        return None
+
+async def extract_text_from_image(image_bytes):
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        return await asyncio.to_thread(pytesseract.image_to_string, image)
+    except Exception as e:
+        logger.error(f"OCR failed: {str(e)}")
+        return ""
+
+async def generate_image_caption(image_bytes):
+    if CAPTION_MODEL_AVAILABLE:
+        try:
+            image = Image.open(io.BytesIO(image_bytes))
+            caption = caption_model(image)[0]['generated_text']
+            return caption
+        except Exception as e:
+            logger.error(f"Image captioning failed: {str(e)}")
+    return "Image captioning not available"
+
+def get_dominant_colors(image_bytes, num_colors=5):
+    image = Image.open(io.BytesIO(image_bytes))
+    image = image.copy()
+    image.thumbnail((100, 100))
+    image = image.convert('RGB')
+    pixels = np.array(image.getdata())
+    kmeans = KMeans(n_clusters=num_colors)
+    kmeans.fit(pixels)
+    colors = [f'#{int(color[0]):02x}{int(color[1]):02x}{int(color[2]):02x}' for color in kmeans.cluster_centers_]
+    return colors
+
+async def detect_faces(image_bytes):
+    image = Image.open(io.BytesIO(image_bytes))
+    opencv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    return len(faces)
+
+async def analyze_image(image_bytes):
+    caption = await generate_image_caption(image_bytes)
+    dominant_colors = get_dominant_colors(image_bytes)
+    face_count = await detect_faces(image_bytes)
+    return {
+        'caption': caption,
+        'dominant_colors': dominant_colors,
+        'face_count': face_count
+    }
+
+async def handle_image(update, context):
+    try:
+        file = await context.bot.get_file(update.message.photo[-1].file_id)
+        image_bytes = await file.download_as_bytearray()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
-        user_collection = user_collections[user_id]
-
-        # Clear previous data for this user
-        user_collection.delete(where={'user_id': str(user_id)})
-
-        # Store text in user-specific ChromaDB collection
-        user_collection.add(
-            documents=[text],
-            metadatas=[{"source": "user_upload", "file_name": update.message.document.file_name, "user_id": str(user_id)}],
-            ids=[str(update.message.document.file_id)]
+        # Parallel execution of OCR, image analysis, and LLaVA analysis
+        extracted_text, image_analysis, llava_analysis = await asyncio.gather(
+            extract_text_from_image(image_bytes),
+            analyze_image(image_bytes),
+            asyncio.to_thread(query_local_model, "llava", f"Describe this image in detail: data:image/jpeg;base64,{base64_image}")
         )
-
-        os.unlink(tmp_file.name)  # Remove the temporary file
-        await update.message.reply_text("PDF processed and stored. You can now ask questions about its content. " + emotions["excited"][2])
-    except Exception as e:
-        logger.error(f"Error processing PDF: {e}")
-        await update.message.reply_text("Sorry, there was an error processing your PDF. Please try again. " + emotions["sad"][0])
-    finally:
-        thinking_task.cancel()
-        await thinking_message.delete()
-
-def detect_language(text: str) -> str:
-    """Detect the language of the input text."""
-    try:
-        lang = detect(text)
-        return 'hi' if lang == 'hi' else 'en'
-    except:
-        return 'en'  # Default to English if detection fails
-
-async def translate_text(text: str, target_language: str) -> str:
-    """Translate text using deep_translator."""
-    try:
-        translator = GoogleTranslator(source='auto', target=target_language)
-        return translator.translate(text)
-    except Exception as e:
-        logger.error(f"Error translating text: {e}")
-        return text  # Return original text if translation fails
-
-def perform_calculation(expression: str) -> str:
-    """Perform a mathematical calculation."""
-    try:
-        result = eval(expression, {"__builtins__": None}, {"sqrt": pow(_, 0.5), "pow": pow})
-        return f"The result of {expression} is {result}"
-    except Exception as e:
-        return f"Sorry, I couldn't calculate that. Error: {str(e)}"
-
-async def get_wikipedia_summary(query: str, sentences: int = 2) -> str:
-    """Fetch a summary from Wikipedia."""
-    try:
-        return wikipedia.summary(query, sentences=sentences)
-    except wikipedia.exceptions.DisambiguationError as e:
-        return f"Your query '{query}' may refer to multiple topics. Please be more specific. Some options are: {', '.join(e.options[:5])}"
-    except wikipedia.exceptions.PageError:
-        return f"Sorry, I couldn't find any Wikipedia page for '{query}'."
-    except Exception as e:
-        logger.error(f"Error fetching Wikipedia summary: {e}")
-        return f"An error occurred while fetching information about '{query}' from Wikipedia."
-
-async def get_user_time(ip_address: str) -> str:
-    """Get the current time for a user based on their IP address."""
-    try:
-        # Use ipapi.co to get location information from IP
-        response = requests.get(f"https://ipapi.co/{ip_address}/json/")
-        data = response.json()
         
-        if "timezone" in data:
-            timezone = pytz.timezone(data["timezone"])
-            current_time = datetime.now(timezone)
-            return f"Based on your IP, your local time is {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')} in {data['city']}, {data['country_name']}"
-        else:
-            return "Sorry, I couldn't determine your location and time based on your IP address."
-    except Exception as e:
-        logger.error(f"Error getting time from IP: {e}")
-        return "An error occurred while trying to get your local time."
+        caption = update.message.caption or "Please describe this image in detail and answer any questions about it."
+        
+        # Combine all image analysis results
+        combined_analysis = f"""LLaVA Analysis: {llava_analysis}
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle user messages, generate responses, perform calculations, fetch Wikipedia data, and get user's local time."""
-    user_id = update.effective_user.id
+Generated Image Caption: {image_analysis['caption']}
+Dominant Colors: {', '.join(image_analysis['dominant_colors'])}
+Number of Faces Detected: {image_analysis['face_count']}
+
+Extracted Text: {extracted_text}
+
+User Caption: {caption}"""
+
+        # Search for additional information
+        wiki_result, ddg_result = await asyncio.gather(
+            search_wikipedia(combined_analysis),
+            search_duckduckgo(combined_analysis)
+        )
+        
+        additional_info = ""
+        if wiki_result:
+            additional_info += f"\n\nWikipedia says: {wiki_result}"
+        if ddg_result:
+            additional_info += f"\n\nAdditional information found: {ddg_result}"
+        
+        final_prompt = f"""{combined_analysis}
+
+Additional Information:
+{additional_info}
+
+Please provide a comprehensive response that addresses the user's question about the image, incorporates the LLaVA analysis, the generated caption (if available), dominant colors, face detection results, any text found in the image, and includes relevant information from the additional sources."""
+
+        ai_response = await asyncio.to_thread(query_local_model, "llama2", final_prompt)
+        await update.message.reply_text(ai_response)
+        
+        # Store the conversation
+        await store_conversation(update.effective_user.id, caption, ai_response)
+    except Exception as e:
+        error_message = f"An error occurred while processing the image: {str(e)}"
+        logger.error(error_message)
+        await update.message.reply_text(error_message)
+
+async def start(update, context):
+    await update.message.reply_text("Hello! I'm an advanced AI bot powered by local models. I can analyze text, images, chat with documents, and provide information from various sources. How can I assist you today?")
+
+async def handle_message(update, context):
     user_message = update.message.text
-    input_language = detect_language(user_message)
+    user_id = update.effective_user.id
+    selected_model = select_model(user_message)
+    
+    try:
+        # Get user history
+        user_history = await get_user_history(user_id)
+        context_prompt = "Previous conversations:\n" + "\n".join([f"User: {msg}\nBot: {resp}" for msg, resp in user_history])
+        
+        # Search documents
+        doc_results = document_collection.query(query_texts=[user_message], n_results=2)
+        doc_context = "\n".join([doc['document'] for doc in doc_results['documents'][0]]) if doc_results['documents'] else ""
+        
+        wiki_result, ddg_result = await asyncio.gather(
+            search_wikipedia(user_message),
+            search_duckduckgo(user_message)
+        )
+        
+        additional_info = ""
+        if wiki_result:
+            additional_info += f"Wikipedia says: {wiki_result}\n\n"
+        if ddg_result:
+            additional_info += f"DuckDuckGo search result: {ddg_result}\n\n"
+        if doc_context:
+            additional_info += f"Relevant document context: {doc_context}\n\n"
+        
+        prompt = f"""Question: {user_message}
 
-    # Check if the message is a mathematical expression
-    if re.match(r'^[\d\+\-\*\/\(\)\s]+$', user_message):
-        result = perform_calculation(user_message)
-        await update.message.reply_text(result + " " + emotions["excited"][1])
+User History:
+{context_prompt}
+
+Additional information:
+{additional_info}
+
+Please provide a comprehensive answer based on the question, user history, and the additional information provided. 
+If the question asks for current information (like exchange rates, stock prices, or recent events), 
+prioritize the information from DuckDuckGo or Wikipedia as it's likely to be more up-to-date. 
+If using this external information or document context, clearly state the source in your response."""
+
+        ai_response = await asyncio.to_thread(query_local_model, selected_model, prompt)
+        model_info = f"\n\n(Model used: {selected_model})"
+        full_response = ai_response + model_info
+        await update.message.reply_text(full_response)
+        
+        # Store the conversation
+        await store_conversation(user_id, user_message, ai_response)
+    except Exception as e:
+        error_message = f"An error occurred: {str(e)}"
+        logger.error(error_message)
+        await update.message.reply_text(error_message)
+
+@functools.lru_cache(maxsize=20)
+def generate_image_stable_diffusion(prompt):
+    try:
+        response = ollama.generate(model="stable-diffusion", prompt=prompt)
+        image_data = base64.b64decode(response['response'].split(',')[1])
+        image = Image.open(io.BytesIO(image_data))
+        return image
+    except Exception as e:
+        logger.error(f"Stable Diffusion image generation failed: {str(e)}")
+        return None
+
+async def handle_generate_command(update, context):
+    prompt = ' '.join(context.args)
+    if not prompt:
+        await update.message.reply_text("Please provide a prompt for image generation. For example: /generate a futuristic city")
         return
 
-    thinking_message = await update.message.reply_text(emotions["confused"][0])
-    async def animate_thinking():
-        for frame in thinking_frames:
-            await thinking_message.edit_text(frame)
-            await asyncio.sleep(0.5)
-
-    thinking_task = asyncio.create_task(animate_thinking())
+    await update.message.reply_text("Generating image... This may take a moment.")
 
     try:
-        # Translate user message to English if it's in Hindi
-        if input_language == 'hi':
-            user_message_en = await translate_text(user_message, 'en')
+        image = await asyncio.to_thread(generate_image_stable_diffusion, prompt)
+
+        if image:
+            buffer = io.BytesIO()
+            image.save(buffer, format='PNG')
+            buffer.seek(0)
+            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=buffer, caption="Generated by Stable Diffusion")
+
+            # Generate description of the image
+            description_prompt = f"Describe the following image that was generated based on this prompt: '{prompt}'. Include details about the composition, colors, and elements present in the image."
+            description = await asyncio.to_thread(query_local_model, "llama2", description_prompt)
+            await update.message.reply_text(f"Image Description:\n\n{description}")
         else:
-            user_message_en = user_message
+            await update.message.reply_text("Sorry, image generation failed. Please try again with a different prompt.")
 
-        # Check for IP-based time request
-        if "my time" in user_message_en.lower() or "local time" in user_message_en.lower():
-            user_ip = update.message.from_user.id  # This is not the actual IP, just a placeholder
-            time_info = await get_user_time(str(user_ip))
-            await update.message.reply_text(time_info + " " + emotions["happy"][0])
-            return
-
-        # Fetch Wikipedia summary
-        wiki_summary = await get_wikipedia_summary(user_message_en)
-
-        # Prepare context information
-        context_info = ""
-        if user_id in user_collections:
-            user_collection = user_collections[user_id]
-            results = user_collection.query(
-                query_texts=[user_message_en],
-                n_results=1
-            )
-            context_info = results['documents'][0][0] if results['documents'] and results['documents'][0] else ""
-
-        # Generate response using Groq API
-        response = groq_client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant with access to the user's uploaded PDF data and Wikipedia information. Respond in the same language as the user's query (English or Hindi)."},
-                {"role": "user", "content": f"Context from PDF: {context_info}\nWikipedia info: {wiki_summary}\n\nUser question: {user_message_en}"}
-            ]
-        )
-
-        bot_response = response.choices[0].message.content
-
-        # Translate bot response if necessary
-        if input_language == 'hi':
-            bot_response = await translate_text(bot_response, 'hi')
-
-        # Add an emotional touch to the response
-        emotion = emotions["happy"][0] if "thank" in user_message.lower() else emotions["excited"][0]
-        await update.message.reply_text(bot_response + " " + emotion)
     except Exception as e:
-        logger.error(f"Error handling message: {e}")
-        await update.message.reply_text("Sorry, there was an error processing your request. Please try again. " + emotions["sad"][1])
-    finally:
-        thinking_task.cancel()
-        await thinking_message.delete()
+        error_message = f"An error occurred during image generation: {str(e)}"
+        logger.error(error_message)
+        await update.message.reply_text(error_message)
 
-def main() -> None:
-    """Set up and run the bot."""
-    application = Application.builder().token("7499836265:AAFnoZWER1-rMFyZe9UC6biGiM09YvvBc-w").build()
+async def handle_add_document(update, context):
+    if not context.args:
+        await update.message.reply_text("Please provide the document text after the /add_document command.")
+        return
+    
+    document_text = ' '.join(context.args)
+    document_collection.add(documents=[document_text], ids=[f"doc_{len(document_collection.get()['ids']) + 1}"])
+    await update.message.reply_text("Document added successfully!")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.Document.PDF, process_pdf))
+def main():
+    init_db()
+    application = Application.builder().token(telegram_token).build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('generate', handle_generate_command))
+    application.add_handler(CommandHandler('add_document', handle_add_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    application.run_polling(stop_signals=None)
 
 if __name__ == '__main__':
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot stopped manually")
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
